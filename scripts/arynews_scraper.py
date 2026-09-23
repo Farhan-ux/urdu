@@ -65,9 +65,11 @@ USER_AGENTS = [
 ]
 
 # Checkpoint settings
-CHECKPOINT_INTERVAL_SECONDS = 30 * 60   # save state every 30 minutes
+CHECKPOINT_INTERVAL_SECONDS = 5 * 60    # save state at least every 5 minutes
+CHECKPOINT_INTERVAL_ARTICLES = 500      # ...or every 500 articles, whichever first
 MAX_PAGES_PER_CATEGORY = 5000           # safety cap (Pakistan has ~5000+ pages)
 PAGES_PER_SHARD = 500                   # how many articles per JSONL shard file
+MONITOR_INTERVAL_SECONDS = 15           # how often to print live status
 
 # Output paths (overridden in Colab to point to Drive)
 OUTPUT_DIR = Path("./urdu_corpus/arynews")
@@ -387,7 +389,7 @@ def save_checkpoint(state):
     tmp.replace(checkpoint_file)  # atomic
 
 # ==========================================================================
-# ARTICLE FETCH LOOP (with checkpointing)
+# ARTICLE FETCH LOOP (with checkpointing + live status monitor)
 # ==========================================================================
 
 def get_current_shard_path(state):
@@ -407,8 +409,80 @@ def append_to_shard(state, article):
         state["current_shard_idx"] += 1
         state["current_shard_count"] = 0
 
+def format_elapsed(seconds):
+    """Format seconds as HH:MM:SS."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def read_last_checkpoint_time():
+    """Read last_saved_at from checkpoint file, return as datetime or None."""
+    cp_file = get_checkpoint_file()
+    if not cp_file.exists():
+        return None
+    try:
+        with open(cp_file, encoding="utf-8") as f:
+            data = json.load(f)
+        last = data.get("last_saved_at")
+        if last:
+            return datetime.fromisoformat(last.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+def stats_monitor(state, fetch_start_time, total_pending, stop_event):
+    """Background thread that prints live stats while scraping.
+    Shows: elapsed time, articles saved, rate, last checkpoint, ETA.
+    """
+    while not stop_event.is_set():
+        elapsed = time.time() - fetch_start_time
+        saved = state["total_saved"]
+        failed = len(state["failed_urls"])
+        completed = len(state["completed_urls"])
+        rate = saved / max(elapsed, 1)
+
+        # Time since last checkpoint (i.e. "data safe up to X ago")
+        last_cp = read_last_checkpoint_time()
+        if last_cp:
+            since_cp = (datetime.now(timezone.utc) - last_cp).total_seconds()
+            cp_str = f"{format_elapsed(since_cp)} ago"
+        else:
+            cp_str = "not yet"
+
+        # ETA
+        remaining = total_pending - completed
+        eta_str = format_elapsed(remaining / rate) if rate > 0.1 else "??"
+
+        # Build status line
+        line = (
+            f"\r[{format_elapsed(elapsed)}] "
+            f"Saved: {saved:,} | "
+            f"Failed: {failed:,} | "
+            f"Rate: {rate:.1f}/s | "
+            f"Last Drive save: {cp_str} | "
+            f"ETA: {eta_str}   "
+        )
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+        stop_event.wait(MONITOR_INTERVAL_SECONDS)
+
+    # Final status when scraping ends
+    elapsed = time.time() - fetch_start_time
+    saved = state["total_saved"]
+    failed = len(state["failed_urls"])
+    rate = saved / max(elapsed, 1)
+    sys.stdout.write("\r" + " " * 100 + "\r")  # clear line
+    sys.stdout.flush()
+    log.info(
+        f"[FINAL] {format_elapsed(elapsed)} elapsed | "
+        f"{saved:,} saved | {failed:,} failed | "
+        f"{rate:.1f} articles/sec avg"
+    )
+
 def fetch_all_articles(url_records):
-    """Main fetch loop with checkpointing."""
+    """Main fetch loop with checkpointing + live monitor."""
     state = load_checkpoint()
     log.info(f"[FETCH] Resuming: {len(state['completed_urls'])} already done, "
              f"{len(url_records) - len(state['completed_urls'])} remaining")
@@ -422,7 +496,18 @@ def fetch_all_articles(url_records):
         return state
 
     last_checkpoint = time.time()
+    articles_since_checkpoint = 0
     lock = threading.Lock()
+
+    # Start live monitor in background
+    fetch_start_time = time.time()
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(
+        target=stats_monitor,
+        args=(state, fetch_start_time, len(pending), stop_event),
+        daemon=True,
+    )
+    monitor_thread.start()
 
     with tqdm(total=len(pending), desc="Articles", unit="art") as pbar:
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -444,21 +529,31 @@ def fetch_all_articles(url_records):
                     else:
                         state["failed_urls"].add(url)
 
-                    # Periodic checkpoint
+                    # Checkpoint by time OR by article count
                     now = time.time()
-                    if now - last_checkpoint > CHECKPOINT_INTERVAL_SECONDS:
+                    articles_since_checkpoint += 1
+                    if (now - last_checkpoint > CHECKPOINT_INTERVAL_SECONDS
+                        or articles_since_checkpoint >= CHECKPOINT_INTERVAL_ARTICLES):
                         save_checkpoint(state)
                         last_checkpoint = now
-                        log.info(f"[CHECKPOINT] Saved. Total: {state['total_saved']} "
-                                 f"articles, {len(state['failed_urls'])} failed")
+                        articles_since_checkpoint = 0
+                        log.info(
+                            f"[CHECKPOINT] Saved to Drive. "
+                            f"Total: {state['total_saved']:,} articles, "
+                            f"{len(state['failed_urls']):,} failed"
+                        )
 
                 pbar.update(1)
                 pbar.set_postfix(saved=state["total_saved"], failed=len(state["failed_urls"]))
 
+    # Stop monitor
+    stop_event.set()
+    monitor_thread.join(timeout=5)
+
     # Final checkpoint
     save_checkpoint(state)
-    log.info(f"[FETCH] DONE. Total saved: {state['total_saved']}, "
-             f"failed: {len(state['failed_urls'])}")
+    log.info(f"[FETCH] DONE. Total saved: {state['total_saved']:,}, "
+             f"failed: {len(state['failed_urls']):,}")
     return state
 
 # ==========================================================================
