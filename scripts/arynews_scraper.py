@@ -49,14 +49,19 @@ CATEGORIES = {
 }
 
 # Network settings
-WORKERS = 16                   # concurrent threads for article fetching (lxml is fast enough to support 16)
-PAGE_WORKERS = 8               # concurrent threads for URL discovery
-REQUEST_TIMEOUT = 30           # seconds (was 20, raised to handle slow responses)
-MAX_RETRIES = 5                # was 4, raised one more attempt for slow pages
-RETRY_BACKOFF = [2, 5, 15, 30, 60]  # seconds between retries (added 60s for severe throttling)
-RATE_LIMIT_DELAY = (0.1, 0.3)  # random sleep between requests (was 0.05-0.15, raised for politeness)
-HTTP_POOL_CONNECTIONS = 20     # connection pool size per host (default 10, raised to kill 'pool full' warnings)
-HTTP_POOL_MAXSIZE = 20         # max pool size
+WORKERS = 4                    # concurrent threads (was 16 — arynews rate-limits hard above 4)
+PAGE_WORKERS = 4               # concurrent threads for URL discovery
+REQUEST_TIMEOUT = 20           # seconds
+MAX_RETRIES = 2                # was 5 — fail fast, retry later in a second pass
+RETRY_BACKOFF = [3, 10]        # seconds between retries (was 2-60s, way too long)
+RATE_LIMIT_DELAY = (1.5, 3.5)  # was 0.1-0.3s — need 2-3 sec between requests to avoid blocks
+HTTP_POOL_CONNECTIONS = 8      # smaller pool for fewer workers
+HTTP_POOL_MAXSIZE = 8
+
+# Adaptive throttling — if we see too many failures, pause and let site recover
+FAILURE_COOLDOWN_THRESHOLD = 5     # if 5+ failures in 60s, trigger cooldown
+FAILURE_COOLDOWN_WINDOW = 60       # window size in seconds
+FAILURE_COOLDOWN_PAUSE = 120       # pause for 2 minutes when triggered
 
 # User agents (rotate to avoid simple UA-based blocking)
 USER_AGENTS = [
@@ -597,6 +602,8 @@ def fetch_all_articles(url_records):
 
     last_checkpoint = time.time()
     articles_since_checkpoint = 0
+    failure_timestamps = []  # track recent failures for adaptive cooldown
+    cooldown_active = False
     lock = threading.Lock()
 
     # Start live monitor in background
@@ -628,6 +635,25 @@ def fetch_all_articles(url_records):
                         state["completed_urls"].add(url)
                     else:
                         state["failed_urls"].add(url)
+                        # Track failure for adaptive cooldown
+                        failure_timestamps.append(time.time())
+                        # Clean old failures (outside window)
+                        cutoff = time.time() - FAILURE_COOLDOWN_WINDOW
+                        failure_timestamps[:] = [t for t in failure_timestamps if t > cutoff]
+
+                        # Check if we need to cool down
+                        if (len(failure_timestamps) >= FAILURE_COOLDOWN_THRESHOLD
+                            and not cooldown_active):
+                            cooldown_active = True
+                            log.warning(
+                                f"[COOLDOWN] {len(failure_timestamps)} failures in "
+                                f"{FAILURE_COOLDOWN_WINDOW}s — pausing "
+                                f"{FAILURE_COOLDOWN_PAUSE}s to let site recover"
+                            )
+                            time.sleep(FAILURE_COOLDOWN_PAUSE)
+                            failure_timestamps.clear()
+                            cooldown_active = False
+                            log.info("[COOLDOWN] Resuming")
 
                     # Checkpoint by time OR by article count
                     now = time.time()
@@ -652,8 +678,69 @@ def fetch_all_articles(url_records):
 
     # Final checkpoint
     save_checkpoint(state)
-    log.info(f"[FETCH] DONE. Total saved: {state['total_saved']:,}, "
+    log.info(f"[FETCH] PASS 1 DONE. Total saved: {state['total_saved']:,}, "
              f"failed: {len(state['failed_urls']):,}")
+
+    # === PASS 2: Retry failed URLs with longer delays ===
+    if state["failed_urls"]:
+        log.info(f"\n[FETCH] >>> PASS 2: Retrying {len(state['failed_urls']):,} failed URLs <<<")
+        # Save failed URLs to retry queue
+        failed_to_retry = list(state["failed_urls"])
+        # Clear failed list so they get retried fresh
+        state["failed_urls"] = set()
+
+        # Use even slower settings for retry pass
+        retry_pending = [{"url": u, "category_name": "unknown"} for u in failed_to_retry]
+        log.info(f"[FETCH] Pass 2: {len(retry_pending)} URLs to retry with longer delays")
+
+        last_checkpoint = time.time()
+        articles_since_checkpoint = 0
+        failure_timestamps = []
+        cooldown_active = False
+
+        with tqdm(total=len(retry_pending), desc="Retry", unit="art") as pbar:
+            with ThreadPoolExecutor(max_workers=2) as ex:  # only 2 workers for retry pass
+                futures = {ex.submit(fetch_one_article, r["url"], r["category_name"]): r for r in retry_pending}
+                for fut in as_completed(futures):
+                    r = futures[fut]
+                    url = r["url"]
+                    try:
+                        article = fut.result()
+                    except Exception as e:
+                        article = None
+
+                    with lock:
+                        if article is not None:
+                            append_to_shard(state, article)
+                            state["completed_urls"].add(url)
+                        else:
+                            state["failed_urls"].add(url)
+                            failure_timestamps.append(time.time())
+                            cutoff = time.time() - FAILURE_COOLDOWN_WINDOW
+                            failure_timestamps[:] = [t for t in failure_timestamps if t > cutoff]
+                            if (len(failure_timestamps) >= FAILURE_COOLDOWN_THRESHOLD
+                                and not cooldown_active):
+                                cooldown_active = True
+                                log.warning(f"[COOLDOWN] Pass 2: pausing {FAILURE_COOLDOWN_PAUSE}s")
+                                time.sleep(FAILURE_COOLDOWN_PAUSE)
+                                failure_timestamps.clear()
+                                cooldown_active = False
+
+                        now = time.time()
+                        articles_since_checkpoint += 1
+                        if (now - last_checkpoint > CHECKPOINT_INTERVAL_SECONDS
+                            or articles_since_checkpoint >= CHECKPOINT_INTERVAL_ARTICLES):
+                            save_checkpoint(state)
+                            last_checkpoint = now
+                            articles_since_checkpoint = 0
+
+                    pbar.update(1)
+                    pbar.set_postfix(saved=state["total_saved"], failed=len(state["failed_urls"]))
+
+        save_checkpoint(state)
+        log.info(f"[FETCH] PASS 2 DONE. Final: {state['total_saved']:,} saved, "
+                 f"{len(state['failed_urls']):,} still failing")
+
     return state
 
 # ==========================================================================
