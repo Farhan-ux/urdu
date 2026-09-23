@@ -49,12 +49,14 @@ CATEGORIES = {
 }
 
 # Network settings
-WORKERS = 16                   # concurrent threads for article fetching
+WORKERS = 16                   # concurrent threads for article fetching (lxml is fast enough to support 16)
 PAGE_WORKERS = 8               # concurrent threads for URL discovery
-REQUEST_TIMEOUT = 20           # seconds
-MAX_RETRIES = 4
-RETRY_BACKOFF = [2, 5, 15, 30]  # seconds between retries
-RATE_LIMIT_DELAY = (0.05, 0.15)  # random sleep between requests (politeness)
+REQUEST_TIMEOUT = 30           # seconds (was 20, raised to handle slow responses)
+MAX_RETRIES = 5                # was 4, raised one more attempt for slow pages
+RETRY_BACKOFF = [2, 5, 15, 30, 60]  # seconds between retries (added 60s for severe throttling)
+RATE_LIMIT_DELAY = (0.1, 0.3)  # random sleep between requests (was 0.05-0.15, raised for politeness)
+HTTP_POOL_CONNECTIONS = 20     # connection pool size per host (default 10, raised to kill 'pool full' warnings)
+HTTP_POOL_MAXSIZE = 20         # max pool size
 
 # User agents (rotate to avoid simple UA-based blocking)
 USER_AGENTS = [
@@ -105,7 +107,15 @@ class HttpClient:
     """Thread-safe HTTP client with retries and UA rotation."""
 
     def __init__(self):
+        # Configure larger connection pool to avoid 'Connection pool is full' warnings
         self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=HTTP_POOL_CONNECTIONS,
+            pool_maxsize=HTTP_POOL_MAXSIZE,
+            max_retries=0,  # we handle retries manually
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
         self._lock = threading.Lock()
 
     def get(self, url):
@@ -136,34 +146,102 @@ class HttpClient:
 http = HttpClient()
 
 # ==========================================================================
-# URL DISCOVERY
+# URL DISCOVERY (via sitemap.xml — 200x faster than walking pagination)
 # ==========================================================================
 
-def extract_article_urls_from_category_page(html):
-    """Extract article URLs from a category index page.
-    arynews uses TagDiv theme; article cards live in <h3 class='entry-title'><a href>.
+import xml.etree.ElementTree as ET
+
+SM_NS = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+
+
+def is_article_url(url):
+    """Heuristic: True if URL is an article, not a category/page/tag/etc."""
+    if not url.startswith(BASE_URL + "/"):
+        return False
+    if any(x in url for x in ['/category/', '/page/', '/tag/', '/author/',
+                              '?s=', 'wp-', '/wp/', 'javascript:']):
+        return False
+    path = urlparse(url).path.strip('/')
+    # Article = single-segment slug after domain
+    return '/' not in path and len(path) > 5
+
+
+def fetch_sitemap(url):
+    """Fetch and parse a sitemap XML file. Returns list of (kind, loc) tuples."""
+    html = http.get(url)
+    if not html:
+        return []
+    try:
+        root = ET.fromstring(html.encode('utf-8') if isinstance(html, str) else html)
+    except ET.ParseError as e:
+        log.warning(f"Failed to parse sitemap {url}: {e}")
+        return []
+
+    entries = []
+    # Sitemap index (contains <sitemap><loc>...)
+    for sm in root.findall('sm:sitemap', SM_NS):
+        loc = sm.find('sm:loc', SM_NS)
+        if loc is not None and loc.text:
+            entries.append(('sitemap', loc.text))
+    # URL set (contains <url><loc>...)
+    for u in root.findall('sm:url', SM_NS):
+        loc = u.find('sm:loc', SM_NS)
+        if loc is not None and loc.text:
+            entries.append(('url', loc.text))
+    return entries
+
+
+def discover_all_urls_via_sitemap():
+    """Discover all article URLs via sitemap.xml.
+    arynews has /sitemap.xml (index) → 352 post-sitemapN.xml files → ~350K article URLs.
+    Takes ~30 seconds at 16 workers vs ~100 minutes walking pagination.
     """
+    log.info("[DISCOVERY] Fetching sitemap index...")
+    index_entries = fetch_sitemap(f"{BASE_URL}/sitemap.xml")
+    sitemap_urls = [loc for kind, loc in index_entries if kind == 'sitemap']
+    log.info(f"[DISCOVERY] Found {len(sitemap_urls)} sub-sitemaps in index")
+
+    # Filter to post-sitemaps (where articles live)
+    post_sitemaps = [u for u in sitemap_urls if 'post-sitemap' in u]
+    log.info(f"[DISCOVERY] {len(post_sitemaps)} are post-sitemaps (contain articles)")
+
+    if not post_sitemaps:
+        log.error("[DISCOVERY] No post-sitemaps found! Falling back to pagination.")
+        return discover_all_urls_via_pagination()
+
+    # Fetch all post-sitemaps concurrently
+    all_article_urls = set()
+    log.info(f"[DISCOVERY] Fetching all {len(post_sitemaps)} post-sitemaps concurrently...")
+
+    with tqdm(total=len(post_sitemaps), desc="Sitemaps", unit="sm") as pbar:
+        with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
+            futures = {ex.submit(fetch_sitemap, u): u for u in post_sitemaps}
+            for fut in as_completed(futures):
+                entries = fut.result()
+                for kind, loc in entries:
+                    if kind == 'url' and is_article_url(loc):
+                        all_article_urls.add(loc)
+                pbar.update(1)
+                pbar.set_postfix(found=f"{len(all_article_urls):,}")
+
+    log.info(f"[DISCOVERY] Total unique article URLs from sitemaps: {len(all_article_urls):,}")
+
+    # Note: sitemap doesn't tell us each article's category.
+    # We extract category from the article page itself during fetch (extract_article does this).
+    return [{"url": u, "category_slug": "unknown", "category_name": "unknown"}
+            for u in sorted(all_article_urls)]
+
+
+def extract_article_urls_from_category_page(html):
+    """Legacy: extract article URLs from a category index page (pagination fallback)."""
     if not html:
         return []
     soup = BeautifulSoup(html, "lxml")
     urls = []
     for h3 in soup.find_all("h3", class_="entry-title"):
         a = h3.find("a", href=True)
-        if a:
-            href = a["href"]
-            # Validate: must be article URL, not category/page/tag
-            if (href.startswith(BASE_URL + "/")
-                and "/category/" not in href
-                and "/page/" not in href
-                and "/tag/" not in href
-                and "/author/" not in href
-                and "?s=" not in href
-                and "wp-" not in href):
-                # Must be a single-segment slug after domain
-                path = urlparse(href).path.strip("/")
-                if "/" not in path and len(path) > 5:
-                    urls.append(href)
-    # Dedupe preserving order
+        if a and is_article_url(a["href"]):
+            urls.append(a["href"])
     seen = set()
     unique = []
     for u in urls:
@@ -174,12 +252,12 @@ def extract_article_urls_from_category_page(html):
 
 
 def discover_urls_for_category(category_slug, category_name):
-    """Walk pagination for one category, return set of article URLs."""
-    log.info(f"[DISCOVERY] Starting category: {category_name} ({category_slug})")
+    """Legacy: walk pagination for one category (fallback if sitemap fails)."""
+    log.info(f"[DISCOVERY-FALLBACK] Starting category: {category_name} ({category_slug})")
     discovered = []
     seen_urls = set()
+    empty_streak = 0
 
-    # Build page URLs
     page_urls = []
     for page_num in range(1, MAX_PAGES_PER_CATEGORY + 1):
         if page_num == 1:
@@ -187,37 +265,29 @@ def discover_urls_for_category(category_slug, category_name):
         else:
             page_urls.append((page_num, f"{BASE_URL}/category/{category_slug}/page/{page_num}/"))
 
-    # Process pages in batches (concurrent within batch, sequential across batches)
     BATCH_SIZE = 20
-    empty_streak = 0
-    last_seen_count = 0
-
     with tqdm(total=min(MAX_PAGES_PER_CATEGORY, len(page_urls)),
               desc=f"  {category_name}", unit="pg") as pbar:
         for batch_start in range(0, len(page_urls), BATCH_SIZE):
             batch = page_urls[batch_start:batch_start + BATCH_SIZE]
-
             with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as ex:
                 futures = {ex.submit(http.get, url): (pnum, url) for pnum, url in batch}
                 results = {}
                 for fut in as_completed(futures):
                     pnum, url = futures[fut]
-                    html = fut.result()
-                    results[pnum] = html
+                    results[pnum] = fut.result()
 
-            # Process in order
-            batch_new_urls = 0
             for pnum, url in batch:
                 html = results.get(pnum)
                 if html is None:
                     empty_streak += 1
+                    pbar.update(1)
                     continue
                 page_urls_found = extract_article_urls_from_category_page(html)
                 if not page_urls_found:
                     empty_streak += 1
+                    pbar.update(1)
                     continue
-
-                # Check if all URLs on this page are already seen (archive end)
                 new_on_page = [u for u in page_urls_found if u not in seen_urls]
                 if not new_on_page:
                     empty_streak += 1
@@ -225,107 +295,137 @@ def discover_urls_for_category(category_slug, category_name):
                     empty_streak = 0
                     for u in new_on_page:
                         seen_urls.add(u)
-                        discovered.append((u, category_slug, category_name))
-                        batch_new_urls += len(new_on_page)
-
+                        discovered.append({"url": u, "category_slug": category_slug, "category_name": category_name})
                 pbar.update(1)
 
-            # If we got 5 consecutive empty/dup pages, archive is exhausted
             if empty_streak >= 5:
-                log.info(f"  [DISCOVERY] {category_name}: stopped at page {batch_start + len(batch)} (archive end)")
+                log.info(f"  [DISCOVERY-FALLBACK] {category_name}: stopped at page {batch_start + len(batch)}")
                 break
 
-            # Don't continue past last batch
-            if batch_start + BATCH_SIZE >= len(page_urls):
-                break
-
-    log.info(f"[DISCOVERY] {category_name}: found {len(discovered)} article URLs")
+    log.info(f"[DISCOVERY-FALLBACK] {category_name}: found {len(discovered)} article URLs")
     return discovered
 
 
-def discover_all_urls():
-    """Run URL discovery for all categories, save to file."""
-    URLS_DIR.mkdir(parents=True, exist_ok=True)
+def discover_all_urls_via_pagination():
+    """Legacy fallback: walk category pagination."""
     all_urls = []
     for cat_slug, cat_name in CATEGORIES.items():
-        urls_file = URLS_DIR / f"urls_{cat_slug}.jsonl"
-        if urls_file.exists():
-            log.info(f"[DISCOVERY] {cat_name}: URLs file exists, loading")
-            with open(urls_file, encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        all_urls.append(json.loads(line))
-            continue
-
         urls = discover_urls_for_category(cat_slug, cat_name)
-        with open(urls_file, "w", encoding="utf-8") as f:
-            for u, cs, cn in urls:
-                f.write(json.dumps({"url": u, "category_slug": cs, "category_name": cn}, ensure_ascii=False) + "\n")
-        for u, cs, cn in urls:
-            all_urls.append({"url": u, "category_slug": cs, "category_name": cn})
+        all_urls.extend(urls)
+    return all_urls
 
-    log.info(f"[DISCOVERY] TOTAL: {len(all_urls)} article URLs across all categories")
+
+def discover_all_urls():
+    """Main discovery entry point. Uses sitemap first, falls back to pagination."""
+    URLS_DIR.mkdir(parents=True, exist_ok=True)
+    urls_file = URLS_DIR / "all_urls.jsonl"
+
+    if urls_file.exists():
+        log.info(f"[DISCOVERY] URLs file exists, loading from {urls_file.name}")
+        all_urls = []
+        with open(urls_file, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    all_urls.append(json.loads(line))
+        log.info(f"[DISCOVERY] Loaded {len(all_urls):,} URLs from cache")
+        return all_urls
+
+    # Try sitemap first (fast)
+    all_urls = discover_all_urls_via_sitemap()
+
+    if not all_urls:
+        log.warning("[DISCOVERY] Sitemap returned 0 URLs, falling back to pagination")
+        all_urls = discover_all_urls_via_pagination()
+
+    # Save for resume
+    with open(urls_file, "w", encoding="utf-8") as f:
+        for r in all_urls:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    log.info(f"[DISCOVERY] TOTAL: {len(all_urls):,} article URLs")
     return all_urls
 
 # ==========================================================================
-# ARTICLE EXTRACTION
+# ARTICLE EXTRACTION (lxml + XPath — 8x faster than BeautifulSoup)
 # ==========================================================================
 
+import lxml.html
+import re
+
+# Pre-compiled regex for body cleanup
+_RE_NEWLINES = re.compile(r'\n\s*\n+')
+_RE_SPACES = re.compile(r'[ \t]+')
+
+
 def extract_article(html, url, category_name):
-    """Extract structured data from an article page."""
+    """Extract structured data from an article page using lxml + XPath.
+    ~8x faster than BeautifulSoup (2.4ms vs 19ms per article).
+    """
     if not html:
         return None
-    soup = BeautifulSoup(html, "lxml")
+    tree = lxml.html.fromstring(html)
 
     # Title: <h1 class="tdb-title-text"> is the actual article title
-    # (NOT entry-title which is for sidebar/related links)
-    title = None
-    h1 = soup.find("h1", class_="tdb-title-text")
-    if h1:
-        title = h1.get_text(strip=True)
-    else:
+    title_nodes = tree.xpath('//h1[contains(@class, "tdb-title-text")]/text()')
+    if not title_nodes:
         # Fallback: first h1 inside <article>
-        article_tag = soup.find("article")
-        if article_tag:
-            h1 = article_tag.find("h1")
-            if h1:
-                title = h1.get_text(strip=True)
-    if not title:
+        title_nodes = tree.xpath('//article//h1//text()')
+    if not title_nodes:
         return None  # probably not an article
+    title = title_nodes[0].strip() if isinstance(title_nodes[0], str) else ''.join(title_nodes).strip()
+    if not title:
+        return None
 
     # Body: <div class="td-post-content">
-    body = None
-    body_div = soup.find("div", class_="td-post-content")
-    if body_div:
-        # Remove inline ads, related boxes
-        for junk in body_div.find_all(class_=["code-block", "td_block_template", "related", "share", "wp-post-navigation"]):
-            junk.decompose()
-        body = body_div.get_text("\n", strip=True)
-    if not body or len(body) < 100:
-        # Try alternate containers
-        for cls in ["tdb-block-inner", "entry-content"]:
-            alt = soup.find(class_=cls)
-            if alt:
-                txt = alt.get_text("\n", strip=True)
-                if txt and len(txt) > len(body or ""):
-                    body = txt
+    body_nodes = tree.xpath('//div[contains(@class, "td-post-content")]')
+    if not body_nodes:
+        return None
+    body_elem = body_nodes[0]
+
+    # Remove ONLY actual junk — style, script, ad blocks, related posts, share buttons
+    # IMPORTANT: do NOT remove tdb-block-inner (that contains the actual article text!)
+    for junk_xpath in [
+        './/style',
+        './/script',
+        './/div[contains(@class, "code-block")]',
+        './/div[contains(@class, "td_block_template")]',
+        './/div[contains(@class, "related")]',
+        './/div[contains(@class, "share")]',
+        './/div[contains(@class, "wp-post-navigation")]',
+        './/div[contains(@class, "td-post-source-tags")]',
+        './/div[contains(@class, "td-post-sharing")]',
+    ]:
+        for junk in body_elem.xpath(junk_xpath):
+            if junk.getparent() is not None:
+                junk.getparent().remove(junk)
+
+    body = body_elem.text_content().strip()
+    # Clean whitespace
+    body = _RE_NEWLINES.sub('\n\n', body)
+    body = _RE_SPACES.sub(' ', body)
+
     if not body or len(body) < 100:
         return None  # too short, probably a stub or video page
 
     # Date: <time class="entry-date" datetime="...">
-    published = None
-    time_tag = soup.find("time", class_="entry-date")
-    if time_tag and time_tag.get("datetime"):
-        published = time_tag["datetime"]
-    else:
-        time_tag = soup.find("time")
-        if time_tag and time_tag.get("datetime"):
-            published = time_tag["datetime"]
+    date_nodes = tree.xpath('//time[contains(@class, "entry-date")]/@datetime')
+    if not date_nodes:
+        date_nodes = tree.xpath('//time/@datetime')
+    published = date_nodes[0] if date_nodes else None
+
+    # Category: extract from article page (overwrites "unknown" from sitemap)
+    cat_nodes = tree.xpath('//a[contains(@href, "/category/") and not(contains(@href, "/page/"))]/text()')
+    real_category = category_name  # default to what was passed in
+    for c in cat_nodes:
+        c = c.strip() if isinstance(c, str) else ''
+        if c and len(c) < 30 and c not in ['صفحہ اول', 'ہوم']:
+            real_category = c
+            break
 
     return {
         "url": url,
         "title": title,
-        "category": category_name,
+        "category": real_category,
         "published_date": published,
         "body_text": body,
         "char_count": len(body),
